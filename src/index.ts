@@ -1,9 +1,9 @@
-import { McpAgent } from "agents/mcp";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/server";
+import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
 
 // TfL journey planner for Tooty's agents.
-// Free TfL Unified API. Optional key: add a secret called TFL_APP_KEY in Cloudflare.
+// Free TfL Unified API. No key needed (about 500 requests a day).
 
 const TFL = "https://api.tfl.gov.uk/Journey/JourneyResults";
 
@@ -42,60 +42,54 @@ function summarise(body: any, from: string, to: string): string {
 	return lines.join("\n");
 }
 
-export class MyMCP extends McpAgent {
-	server = new McpServer({ name: "TfL journey planner", version: "1.0.0" });
+function createServer() {
+	const server = new McpServer({ name: "TfL journey planner", version: "1.0.0" });
 
-	async init() {
-		this.server.tool(
-			"plan_journey",
-			"Real TfL journey times in London and the South East (tube, rail, bus, walking). Use for travel blocks and departure times. Places can be station names, postcodes or 'lat,lon'.",
-			{
+	server.registerTool(
+		"plan_journey",
+		{
+			description:
+				"Real TfL journey times in London and the South East (tube, rail, bus, walking). Use for travel blocks and departure times. Places can be station names, postcodes or 'lat,lon'.",
+			inputSchema: z.object({
 				from: z.string().describe("Start, e.g. 'East Croydon' or a postcode"),
 				to: z.string().describe("Destination, e.g. 'Tottenham Court Road' or a postcode"),
 				date: z.string().optional().describe("Date as YYYYMMDD; default today"),
 				time: z.string().optional().describe("Time as HHMM, 24-hour"),
 				arriveBy: z.boolean().optional().describe("true = time is the arrival time; false = departure time"),
 				walkingOnly: z.boolean().optional().describe("true = walking route only"),
-			},
-			async ({ from, to, date, time, arriveBy, walkingOnly }) => {
-				const params = new URLSearchParams();
-				if (date) params.set("date", date);
-				if (time) params.set("time", time);
-				if (time) params.set("timeIs", arriveBy ? "Arriving" : "Departing");
-				if (walkingOnly) params.set("mode", "walking");
-				const key = (this.env as any)?.TFL_APP_KEY;
-				if (key) params.set("app_key", key);
+			}),
+		},
+		async ({ from, to, date, time, arriveBy, walkingOnly }) => {
+			const params = new URLSearchParams();
+			if (date) params.set("date", date);
+			if (time) params.set("time", time);
+			if (time) params.set("timeIs", arriveBy ? "Arriving" : "Departing");
+			if (walkingOnly) params.set("mode", "walking");
 
-				let f = from;
-				let t = to;
-				let r = await callTfl(f, t, params);
+			let r = await callTfl(from, to, params);
 
-				// TfL returns 300 when a place name is ambiguous: pick the best match and retry once.
-				if (r.status === 300) {
-					f = pickBest(r.body?.fromLocationDisambiguation) ?? f;
-					t = pickBest(r.body?.toLocationDisambiguation) ?? t;
-					r = await callTfl(f, t, params);
-				}
+			// TfL returns 300 when a place name is ambiguous: pick the best match and retry once.
+			if (r.status === 300) {
+				const f = pickBest(r.body?.fromLocationDisambiguation) ?? from;
+				const t = pickBest(r.body?.toLocationDisambiguation) ?? to;
+				r = await callTfl(f, t, params);
+			}
 
-				const text =
-					r.status === 200
-						? summarise(r.body, from, to)
-						: `TfL error ${r.status}: ${r.body?.message ?? "no journeys found"}. Try a station name or postcode.`;
-				return { content: [{ type: "text", text }] };
-			},
-		);
-	}
+			const text =
+				r.status === 200
+					? summarise(r.body, from, to)
+					: `TfL error ${r.status}: ${r.body?.message ?? "no journeys found"}. Try a station name or postcode.`;
+			return { content: [{ type: "text", text }] };
+		},
+	);
+
+	return server;
 }
+
+const handler = createMcpHandler(createServer);
 
 export default {
 	fetch(request: Request, env: Env, ctx: ExecutionContext) {
-		const url = new URL(request.url);
-		if (url.pathname === "/sse" || url.pathname === "/sse/message") {
-			return MyMCP.serveSSE("/sse").fetch(request, env, ctx);
-		}
-		if (url.pathname === "/mcp") {
-			return MyMCP.serve("/mcp").fetch(request, env, ctx);
-		}
-		return new Response("TfL MCP is running. Connect to /mcp", { status: 200 });
+		return handler(request, env, ctx);
 	},
-};
+} satisfies ExportedHandler<Env>;
