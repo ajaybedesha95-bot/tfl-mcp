@@ -3,7 +3,7 @@ import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
 
 // TfL journey planner for Tooty's agents.
-// Free TfL Unified API. No key needed (about 500 requests a day).
+// Free TfL Unified API. Key comes from the Cloudflare secret TFL_APP_KEY.
 
 const TFL = "https://api.tfl.gov.uk/Journey/JourneyResults";
 
@@ -15,6 +15,7 @@ function pickBest(dis: any): string | null {
 }
 
 async function callTfl(from: string, to: string, params: URLSearchParams) {
+	params.set("nationalSearch", "true");
 	const url = `${TFL}/${encodeURIComponent(from)}/to/${encodeURIComponent(to)}?${params}`;
 	const res = await fetch(url, { headers: { "User-Agent": "tfl-mcp" } });
 	const body: any = await res.json().catch(() => ({}));
@@ -28,8 +29,8 @@ function fmtTime(iso: string) {
 function summarise(body: any, from: string, to: string): string {
 	const journeys: any[] = body?.journeys ?? [];
 	if (!journeys.length) return `No journeys found from ${from} to ${to}.`;
-	const lines = [`Journeys from ${from} to ${to}:`];
-	journeys.slice(0, 3).forEach((j, i) => {
+	const lines = [`Journeys from ${from} to ${to}, fastest first:`];
+	[...journeys].sort((a, b) => a.duration - b.duration).slice(0, 5).forEach((j, i) => {
 		lines.push(
 			`\nOption ${i + 1}: ${j.duration} min, depart ${fmtTime(j.startDateTime)}, arrive ${fmtTime(j.arrivalDateTime)}`,
 		);
@@ -42,7 +43,7 @@ function summarise(body: any, from: string, to: string): string {
 	return lines.join("\n");
 }
 
-function createServer() {
+function createServer(key?: string) {
 	const server = new McpServer({ name: "TfL journey planner", version: "1.0.0" });
 
 	server.registerTool(
@@ -65,6 +66,7 @@ function createServer() {
 			if (time) params.set("time", time);
 			if (time) params.set("timeIs", arriveBy ? "Arriving" : "Departing");
 			if (walkingOnly) params.set("mode", "walking");
+			if (key) params.set("app_key", key);
 
 			let r = await callTfl(from, to, params);
 
@@ -86,10 +88,9 @@ function createServer() {
 	return server;
 }
 
-const handler = createMcpHandler(createServer);
-
 export default {
 	fetch(request: Request, env: Env, ctx: ExecutionContext) {
-		return handler(request, env, ctx);
+		const key = (env as any).TFL_APP_KEY as string | undefined;
+		return createMcpHandler(() => createServer(key))(request, env, ctx);
 	},
 } satisfies ExportedHandler<Env>;
